@@ -72,7 +72,7 @@ typedef enum {
     NOB_ERROR,
 } Nob_Log_Level;
 
-void nob_log(Nob_Log_Level level, const char *fmt, ...);
+void nob_log(Nob_Log_Level level, const char *fmt, ...) __attribute__ (( format(printf,2,3) ));
 
 // It is an equivalent of shift command from bash. It basically pops a command line
 // argument from the beginning.

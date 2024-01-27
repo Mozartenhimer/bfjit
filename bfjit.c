@@ -1,12 +1,16 @@
 #include <stdio.h>
 #include <stdint.h>
-
+#include <string.h>
+#include <sys/types.h>
+#define __USE_GNU
+#include <signal.h>
+#include <unistd.h>
 #include <sys/mman.h>
-
+#include <sys/ucontext.h>
 #define NOB_IMPLEMENTATION
 #include "nob.h"
-
-#define JIT_MEMORY_CAP (10*1000*1000)
+#define PAGE_SIZE 4096
+#define JIT_MEMORY_START (void*)(0x69420)
 
 typedef enum {
     OP_INC             = '+',
@@ -59,9 +63,6 @@ typedef struct {
 bool interpret(Ops ops)
 {
     bool result = true;
-    // TODO: there is a memory management discrepancy between interpretation and JIT.
-    // Interpretation automatically extends the memory, but JIT has a fixed size memory (to simplify implementation).
-    // This discrepancy should be closed somehow
     Nob_String_Builder memory = {0};
     nob_da_append(&memory, 0);
     size_t head = 0;
@@ -155,6 +156,81 @@ typedef struct {
     size_t capacity;
 } Backpatches;
 
+
+void* page_align(void* addr){
+	return (void*)(((uint64_t)addr>>12)<<12);
+}
+typedef struct {
+    void* low_page;
+    void* mem_start;
+    void* high_page;
+    int n_pages;
+} MemoryManager;
+
+static MemoryManager mm = {0};
+// You could get away without guard pages, just by putting the memory in a 
+// lonely part of memory, but then you don't get guarantees that you're not 
+// addressing some other part of the heap
+bool mm_alloc(MemoryManager* mm,int n_pages){
+    mm->n_pages = n_pages;
+    void* memory = mmap(JIT_MEMORY_START, PAGE_SIZE*(n_pages+2),
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) {
+        nob_log(NOB_ERROR, "Could not allocate JIT tape memory: %s", strerror(errno));
+        return false;
+    }
+    
+    mm->low_page = memory;
+    mm->high_page = memory+2*PAGE_SIZE;
+    memory += PAGE_SIZE;
+    mm->mem_start = memory;
+    if(mprotect(mm->mem_start, PAGE_SIZE*n_pages, PROT_READ | PROT_WRITE) != 0){
+        nob_log(NOB_ERROR, "Could not change memory permissions: %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+void mm_free(MemoryManager*m){
+    if(m->low_page)  munmap(m->low_page, PAGE_SIZE);
+    if(m->high_page) munmap(m->high_page, PAGE_SIZE);
+    if(m->mem_start) munmap(m->mem_start, m->n_pages*PAGE_SIZE);
+    memset(m,0,sizeof(*m));
+}
+void mm_grow(MemoryManager* mm, int n_pages){
+    MemoryManager new = {0};
+    assert(n_pages >= mm->n_pages);
+    mm_alloc(&new, n_pages);
+    memcpy(new.mem_start,mm->mem_start,mm->n_pages*PAGE_SIZE);
+    munmap(mm->low_page, (mm->n_pages+2)*PAGE_SIZE);
+    memcpy(mm, &new, sizeof(*mm));
+}
+void segfault_handler(int num,siginfo_t * info , void* vcontext){
+	// printf("Handling segmentation fault\n");
+    ucontext_t* context = vcontext;
+	void* addr = info->si_addr;
+    uint64_t rdi = context->uc_mcontext.gregs[REG_RDI];
+        
+    int64_t offset = rdi - (uint64_t)mm.mem_start;
+    if(page_align(addr) == mm.low_page){
+        nob_log(NOB_ERROR,"Brainfuck program had a memory underflow.\n");
+        abort();
+    }
+    if(page_align(addr) == mm.high_page){
+        size_t new_size = mm.n_pages*2;
+        mm_grow(&mm,new_size);        
+        nob_log(NOB_INFO,"Expanding brainfuck program memory to 0x%lx bytes.\n",new_size*PAGE_SIZE);
+        context->uc_mcontext.gregs[REG_RDI] = (uint64_t)(mm.mem_start+offset);
+        return;
+
+    }
+    // TODO: It make actually be possible to statically determine the reachability of memory addresses.
+    // and therefore know that if it's possible to  "skip over" these gaurd pages. 
+    // Or alternatively, you could make the guard pages hundreds of gigabytes, which will be fine because 
+    // they'll never be commited.
+    nob_log(NOB_ERROR,"Brainfuck program went way out of it's address space with offset %ld",offset);
+    abort();
+}
 bool jit_compile(Ops ops, Code *code)
 {
     bool result = true;
@@ -383,7 +459,7 @@ int main(int argc, char **argv)
     int result = 0;
     Ops ops = {0};
     Code code = {0};
-    void *memory = NULL;
+    // void *memory = NULL;
 
     const char *program = nob_shift_args(&argc, &argv);
 
@@ -420,17 +496,29 @@ int main(int argc, char **argv)
         if (!interpret(ops)) nob_return_defer(1);
     } else {
         nob_log(NOB_INFO, "JIT: on");
+
+
         if (!jit_compile(ops, &code)) nob_return_defer(1);
-        memory = malloc(JIT_MEMORY_CAP);
-        memset(memory, 0, JIT_MEMORY_CAP);
-        assert(memory != NULL);
-        code.run(memory);
+
+        if(! mm_alloc(&mm,1)) nob_return_defer(1);
+        // Register segmentation fault handler just before running jit code
+        struct sigaction sa = {
+            .sa_sigaction = segfault_handler,
+            .sa_flags = SA_SIGINFO,
+        };
+        sigemptyset(&sa.sa_mask);
+        if(sigaction(SIGSEGV, &sa,NULL) == -1){
+            nob_log(NOB_WARNING,"Failed to register segmentation fault handler. Memory management will not work.");
+        }
+        code.run(mm.mem_start);
+        
+        sigaction(SIGSEGV,NULL,NULL);
     }
 
 defer:
+    mm_free(&mm);
     nob_da_free(ops);
     free_code(code);
-    free(memory);
     return result;
 }
 
